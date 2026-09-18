@@ -1,124 +1,265 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# GridWise LLM — Smart Campus Energy Optimizer
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+BUP CSE Fest 2026 · Online Preliminary · Grid Energy Optimization Challenge
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
+An LLM-in-the-loop 24-hour campus energy optimizer. It reads 1–3 natural-language
+operator notes, turns each into a structured directive, and returns a minimum-cost
+hourly grid-import schedule that obeys every directive and battery constraint.
 
-## Description
+**Live endpoint:** https://gridwise.<your-domain>
+**Docker image:** `ghcr.io/<your-user>/gridwise:latest`
+**Swagger UI:** `/docs` (served by the app itself)
 
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
+## What it does
 
-## Project setup
+The service accepts a single `POST /optimize-energy` request describing:
 
-```bash
-$ npm install
+- 24 hourly rows of demand, solar forecast and tariff,
+- a battery specification (capacity, starting energy, minimum reserve, charge/discharge rates),
+- 1–3 free-text operator notes (e.g. *"solar panels washed from noon until 2 PM; treat solar as 25%"*).
+
+An LLM interprets every note into a structured directive. Deterministic guardrails
+validate it, a linear program computes the least-cost feasible schedule, and a replay
+validator re-checks every constraint against the plan before the response is returned.
+
+Everything is served over two endpoints:
+
+| Endpoint | Purpose |
+|---|---|
+| `GET /health` | Readiness check — returns `{"status":"ok"}`, no LLM/database dependency. |
+| `POST /optimize-energy` | Interpret notes + return the optimal 24-hour plan. |
+
+## Architecture
+
+```
+POST /optimize-energy
+  → DTO validation (class-validator)          src/dto/
+  → cache lookup                               src/common/cache.service.ts
+  → LLM interpreter (1 call per note)          src/llm/
+  → deterministic guardrails                   src/guardrails/
+  → LP optimizer                                src/optimizer/optimizer.service.ts
+  → replay validator                            src/validator/final-validator.service.ts
+  → response builder                            src/gridwise/gridwise.service.ts
 ```
 
-## Compile and run the project
+| Stage | Source | Role |
+|---|---|---|
+| Request validation | `src/dto/optimize-energy-request.dto.ts` | 24 unique hours 0–23, 1–3 non-empty notes, finite non-negative numbers, `minimum ≤ initial ≤ capacity`. |
+| LLM interpreter | `src/llm/llm-interpreter.service.ts` | Interprets **every** operator note (directive type, window, value). Required path. |
+| LLM client | `src/llm/llm-client.service.ts` | OpenAI-compatible `/chat/completions` call, temperature 0, JSON mode, timeout + provider retries. |
+| Guardrails | `src/guardrails/guardrail-validator.service.ts` | Allowed types, note mapping, hours 0–23 unique ascending, `factor ∈ [0,1]`, reserve ≤ capacity, cap ≥ 0. Invalid LLM output → rejected (reprompt), or `no_op` never fabricated. |
+| Fallback | `src/guardrails/heuristic-fallback.service.ts` | Used only if the LLM fails; classified output is labelled in `explanation`. |
+| Optimizer | `src/optimizer/optimizer.service.ts` | Linear program (`javascript-lp-solver`), 120 variables (grid, solar, charge, discharge, battery state × 24 h), solved per request. |
+| Replay validator | `src/validator/final-validator.service.ts` | Judge-style hour-by-hour replay of balance, solar caps, battery bounds, directive windows, neutrality and totals. |
+
+**LLM provider / model:** any OpenAI-compatible endpoint. Configure via
+`LLM_BASE_URL`, `LLM_MODEL`, `LLM_API_KEY` (temperature 0, JSON mode).
+
+## Quickstart (local)
+
+Requires Node.js ≥ 22 and npm.
 
 ```bash
-# development
-$ npm run start
-
-# watch mode
-$ npm run start:dev
-
-# production mode
-$ npm run start:prod
+git clone <your-repo-url> && cd gridwise
+npm ci
+cp .env.example .env          # then fill in LLM_BASE_URL / LLM_MODEL / LLM_API_KEY
+npm run build
+npm run start:prod            # production mode (serves dist/main.js)
 ```
 
-## Run tests
+Or in development watch mode:
 
 ```bash
-# unit tests
-$ npm run test
-
-# e2e tests
-$ npm run test:e2e
-
-# test coverage
-$ npm run test:cov
+npm run start:dev
 ```
 
-## Deployment
+Service listens on `0.0.0.0:3000` by default. Open `http://localhost:3000/docs`
+for interactive Swagger documentation.
 
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
+## Configuration
 
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
+All configuration is read from environment variables (never from the codebase).
+Copy `.env.example` → `.env` to get started.
+
+| Variable | Required | Default | Purpose |
+|---|---|---|---|
+| `HOST` | no | `0.0.0.0` | Listen address. |
+| `PORT` | no | `3000` | Listen port. |
+| `LLM_BASE_URL` | yes* | Gemini OpenAI-compat endpoint | OpenAI-compatible base URL of the primary provider. |
+| `LLM_MODEL` | yes* | `gemini-2.0-flash` | Model ID. |
+| `LLM_API_KEY` | yes* | — | Secret; never commit it. |
+| `LLM_CHAT_COMPLETIONS_PATH` | no | `/chat/completions` | Path appended to `LLM_BASE_URL`. |
+| `LLM_TIMEOUT_MS` | no | `9000` | Per-provider-call timeout. |
+| `LLM_MAX_REPROMPTS` | no | `1` | Guardrail-feedback retries per note. |
+| `LLM_MAX_PROVIDER_RETRIES` | no | `1` | Transient provider retries. |
+| `LLM_TEMPERATURE` | no | `0` | Sampling temperature. |
+| `ENABLE_HEURISTIC_FALLBACK` | no | `true` | Deterministic parse when the LLM is unreachable. |
+| `CACHE_ENABLED` | no | `true` | In-memory response cache. |
+| `CACHE_TTL_MS` | no | `300000` | Cache TTL. |
+| `CACHE_MAX_ENTRIES` | no | `128` | Cache size before eviction. |
+| `REQUEST_TIMEOUT_MS` | no | `25000` | Overall request budget (judge bound is 30 s). |
+| `BODY_LIMIT_MB` | no | `1` | Max request body size. |
+| `SWAGGER_ENABLED` | no | `true` | Serve `/docs`. |
+
+\* The service starts and answers `/health` without any LLM variable set;
+`/optimize-energy` then uses the labelled heuristic fallback parser.
+
+## Test it
 
 ```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
+curl -s http://localhost:3000/health
+# {"status":"ok"}
 ```
 
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
-
-## Observability
-
-In production applications, observability is essential for understanding how your system behaves, detecting issues early, and maintaining reliable performance.
-
-[NestJS Observe](https://observe.nestjs.com) automatically instruments your NestJS application, giving you deep visibility into your system with minimal setup:
-
-- **Distributed tracing:** Follow requests across services and understand how they flow through your system.
-- **Waterfall analysis:** Visualize request execution and identify slow operations, bottlenecks, and unexpected delays.
-- **Performance analysis:** Analyze application performance in real time and quickly pinpoint areas that need optimization.
-- **Metrics:** Track key application and infrastructure metrics to understand system health and performance trends.
-- **Logging:** Centralize and correlate logs with traces and other telemetry to make debugging easier.
-- **Error tracking:** Detect errors quickly and investigate their root causes with the surrounding context.
-- **SLA monitoring:** Track service-level objectives and identify when your application is approaching or exceeding defined thresholds.
-- **Alarms and alerts:** Set up alerts for critical errors, performance degradation, SLA violations, and other anomalies so your team can react quickly.
-
-To add it to this project:
+A full sample request is included in `docs/test-cases.json`. Posting case
+`SAMPLE-01` straight from that file:
 
 ```bash
-$ npm install @nestjs/observe
+node --input-type=module -e '
+import { readFileSync } from "node:fs";
+const doc = JSON.parse(readFileSync("docs/test-cases.json","utf8"));
+console.log(JSON.stringify(doc.cases[0].input));' > /tmp/case1.json
+
+curl -s -X POST http://localhost:3000/optimize-energy \
+  -H "Content-Type: application/json" -d @/tmp/case1.json | head -c 600
 ```
 
-Then follow the [setup guide](https://docs.nestjs.com/observability/overview) - it takes a single import and an app key.
+### Run all 10 public samples
 
-The free plan needs no payment details and covers 300,000 events a month. You can also browse the [live demo](https://www.observe-demo.nestjs.com/dashboard) first - the whole dashboard over a busy service's data, with nothing to install.
+```bash
+npm run test:docs
+```
 
-## Resources
+This drives the **real pipeline** (request → LLM stub with reference
+interpretations → guardrails → LP → replay validator) for every case in
+`docs/test-cases.json`.
 
-Check out a few resources that may come in handy when working with NestJS:
+Expected result:
 
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Auto-instrument your application with [NestJS Observe](https://observe.nestjs.com). Distributed tracing, metrics, and logging made easy. Error tracking and performance monitoring for your NestJS applications.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
+```
+Test Files  1 passed (1)
+     Tests  30 passed (30)
+```
 
-## Support
+The same reference cases are also exercised end-to-end over HTTP in `npm run test:e2e`,
+and the plain unit/contract suites with:
 
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
+```bash
+npm test            # unit suites (optimizer, fallback, …)
+npm run test:e2e    # full HTTP lifecycle
+npm run test:samples # standalone sample runner
+```
 
-## Stay in touch
+## Docker
 
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
+### Image (build or pull)
 
-## License
+```bash
+docker build -t ghcr.io/<your-user>/gridwise:latest .
+# or
+docker pull ghcr.io/<your-user>/gridwise:latest
+```
 
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+### Run locally
+
+```bash
+docker run --rm -p 3000:3000 \
+  -e LLM_BASE_URL=<url> -e LLM_MODEL=<model> -e LLM_API_KEY=<key> \
+  ghcr.io/<your-user>/gridwise:latest
+curl -s http://localhost:3000/health
+```
+
+### Compose
+
+```bash
+cp .env.example .env   # fill in credentials (never commit .env)
+docker compose up -d --build
+docker compose ps      # health check must show healthy
+```
+
+The container binds `0.0.0.0:3000`, runs as a non-root user, exposes no secrets,
+and includes a `HEALTHCHECK` against `/health`. `/health` works with **zero**
+environment variables set — the LLM key is used only for note interpretation.
+
+## API
+
+### `GET /health`
+
+```json
+{"status":"ok"}
+```
+
+### `POST /optimize-energy`
+
+**Request** (`OptimizeEnergyRequestDto`):
+
+| Field | Type | Constraint |
+|---|---|---|
+| `scenario_id` | string | non-empty; echoed back |
+| `operator_notes` | string[] | 1–3 non-empty strings |
+| `hours` | object[24] | exactly hours 0–23 once each |
+| `battery` | object | `minimum ≤ initial ≤ capacity`, rates ≥ 0 |
+
+Each hour: `{ "hour": 0..23, "demand_kwh", "solar_kwh", "tariff_bdt_per_kwh" }` (all ≥ 0, finite).
+
+**Response** (`OptimizeEnergyResponseDto`): `scenario_id`, `directive_interpretation[]`
+(one per note, in order), `hourly_plan[24]`, `total_grid_kwh`, `total_cost_bdt`,
+`peak_grid_kwh`, `plan_summary`.
+
+**Status codes:**
+
+| Code | Meaning |
+|---|---|
+| `200` | Valid result (also returned with fallback interpretations when the LLM is down). |
+| `400` | Malformed JSON or invalid request body. |
+| `500` | Controlled internal error (includes replay failure and request timeout). |
+
+Example 400 body:
+
+```json
+{
+  "statusCode": 400,
+  "message": [
+    "operator_notes must be an array",
+    "hours must contain exactly 24 entries covering every hour 0 through 23 exactly once",
+    "battery values are semantically invalid (0 <= minimum <= capacity, 0 <= initial <= capacity, rates >= 0)"
+  ],
+  "error": "Bad Request"
+}
+```
+
+## Dependencies and credits
+
+Runtime: NestJS 12, class-validator / class-transformer, `javascript-lp-solver`,
+`@nestjs/config`, Swagger UI. Dev: Vitest, Oxlint, TypeScript, tsx.
+
+LLM: any OpenAI-compatible provider (see Configuration).
+
+AI coding assistants were used during development; architecture and logic were
+reviewed, tested and owned by the team.
+
+## Known limitations
+
+- Interpretation quality depends on the external LLM. If all provider attempts
+  fail, a deterministic heuristic fallback is used and flagged in `explanation`.
+- Windows written as words without digits (e.g. "noon", "midnight") are supported
+  by the fallback parser; more exotic phrasings are best handled by the LLM path.
+- The battery model has no efficiency loss and no grid export (a single signed
+  hourly battery flow); this matches the problem statement.
+- The in-memory cache is per-process and cleared on restart; repeat requests within
+  the TTL return the cached plan for the same payload.
+- A note that implies two directive types at once is mapped to a single type.
+
+## Secret handling
+
+Secrets are read from environment variables only.
+
+- `.env` is in `.gitignore` **and** `.dockerignore`; `.env.example` is committed.
+- Logs contain scenario id, latency and directive types — never keys, prompts or request bodies.
+- The Docker image contains no credentials; `/health` needs none.
+
+Verify quickly that nothing leaked after cloning:
+
+```bash
+git grep -iE "sk-|api_key=.+" || echo "clean"
+```
