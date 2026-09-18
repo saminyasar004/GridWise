@@ -127,7 +127,7 @@ export class HeuristicFallbackService {
   private tryNoCharge(text: string): Classification | null {
     const mentionsCharge = /\b(charg|charger|recharge)\w*\b/.test(text);
     const prohibits =
-      /\b(no|not|cannot|can't|must not|do not|don't|avoid|stop|unavailable|disabled|isolat|offline|maintenance|inspect|outage|refrain|prohibit)\b/.test(
+      /\b(no|not|cannot|can't|must not|do not|don't|avoid|stop|unavailable|disabled|isolat|offline|maintenance|inspect|outage|refrain|prohibit\w*)\b/.test(
         text,
       );
     if (!mentionsCharge || !prohibits) return null;
@@ -145,7 +145,7 @@ export class HeuristicFallbackService {
   private tryNoDischarge(text: string): Classification | null {
     const mentionsDischarge = /\b(discharg)\w*\b/.test(text);
     const prohibits =
-      /\b(no|not|cannot|can't|must not|do not|don't|avoid|stop|unavailable|disabled|isolat|offline|maintenance|test|relay|protect|refrain|prohibit)\b/.test(
+      /\b(no|not|cannot|can't|must not|do not|don't|avoid|stop|unavailable|disabled|isolat|offline|maintenance|test|relay|protect|refrain|prohibit\w*)\b/.test(
         text,
       );
     if (!mentionsDischarge || !prohibits) return null;
@@ -218,7 +218,9 @@ export class HeuristicFallbackService {
   }
 
   private parseTimeRange(text: string): TimeRange | null {
-    const lower = text;
+    const lower = text
+      .replace(/\bmidnight\b/g, '12:00 am')
+      .replace(/\bnoon\b/g, '12:00 pm');
 
     const tokens = [
       ...lower.matchAll(
